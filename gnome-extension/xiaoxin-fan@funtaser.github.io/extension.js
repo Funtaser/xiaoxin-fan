@@ -20,6 +20,7 @@ const IFACE_XML = `
     <method name="ListPresets"><arg type="s" direction="out"/></method>
     <method name="SetPreset"><arg type="s" direction="in"/><arg type="s" direction="out"/></method>
     <signal name="StatusChanged"><arg type="s"/></signal>
+    <signal name="PresetChanged"><arg type="s"/><arg type="s"/></signal>
   </interface>
 </node>`;
 const FanProxy = Gio.DBusProxy.makeProxyWrapper(IFACE_XML);
@@ -44,6 +45,9 @@ function presetIcon(path, id) {
     const icon = PRESET_ICONS[id] ?? 'emblem-system-symbolic';
     return icon.startsWith('icons/') ? Gio.icon_new_for_string(`${path}/${icon}`) : icon;
 }
+
+// 屏幕中央提示的文字：Fn+Q 等外部切换、插拔电源自动切换（面板里自己点的不提示）
+const OSD_PREFIX = {external: '性能模式', ac: '已接通电源', battery: '使用电池'};
 
 // 预设列表右侧的要点：持续功耗上限 · 最高转速
 function presetHint(p) {
@@ -266,6 +270,15 @@ const FanToggle = GObject.registerClass({
                     this._statusItem.repaint();
                 this._sync();
             });
+            this._osdSignalId = proxy.connectSignal('PresetChanged', (_p, _sender, [id, cause]) => {
+                const prefix = OSD_PREFIX[cause];
+                if (!prefix)
+                    return;
+                const icon = presetIcon(this._path, id);
+                Main.osdWindowManager.showAll(
+                    typeof icon === 'string' ? new Gio.ThemedIcon({name: icon}) : icon,
+                    `${prefix} · ${this._presets[id]?.label ?? id}`, null, null);
+            });
             this._ownerId = proxy.connect('notify::g-name-owner', () => this._refresh());
             this._refresh();
         }, null, Gio.DBusProxyFlags.DO_NOT_LOAD_PROPERTIES);
@@ -353,6 +366,8 @@ const FanToggle = GObject.registerClass({
         if (this._proxy) {
             if (this._signalId)
                 this._proxy.disconnectSignal(this._signalId);
+            if (this._osdSignalId)
+                this._proxy.disconnectSignal(this._osdSignalId);
             if (this._ownerId)
                 this._proxy.disconnect(this._ownerId);
             this._proxy = null;

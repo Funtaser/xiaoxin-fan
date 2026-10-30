@@ -65,6 +65,9 @@ class FakeHardware:
     def power_source(self):
         return self.source
 
+    def battery_percent(self):
+        return 80
+
     def set_power_cap(self, watts):
         self.power_cap = watts
 

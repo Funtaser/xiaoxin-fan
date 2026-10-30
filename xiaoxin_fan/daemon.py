@@ -4,8 +4,9 @@
   · 每秒：读温度 → Controller 计算目标 → 目标变化时写 EC（另每 30 秒重写一次）
   · D-Bus：io.github.XiaoxinFan（系统总线；--fake 时用会话总线）
   · 休眠：持有 logind 延迟锁，休眠前交还 EC，唤醒后重新应用预设
-  · 跟随 GNOME 电源菜单：platform_profile 被外部修改时切换到对应预设
-  · 插拔电源：插电 / 电池各记住一个预设，电源稳定变化后自动切换
+  · 跟随外部切换（Fn+Q、powerprofilesctl、GNOME 低电量省电）：platform_profile 被外部修改时切换到对应预设
+  · 插拔电源：插电 / 电池各记住一个预设（手动选择与 Fn+Q），电源稳定变化后自动切换
+  · 预设被切换时发出 PresetChanged(预设, 原因) 信号，面板据此弹出屏幕提示
   · 退出（SIGTERM/SIGINT/异常）：交还 EC
 """
 
@@ -31,6 +32,7 @@ IFACE = "io.github.XiaoxinFan1"
 STATE_FILE = "/var/lib/xiaoxin-fan/state.json"
 REWRITE_INTERVAL = 30.0
 STARTUP_SETTLE = 10.0     # 启动后这段时间内不跟随 platform_profile 变化（等 power-profiles-daemon 恢复状态）
+LOW_BATTERY = 25          # 电池电量不高于此值时切到 low-power，视为系统自动省电，不记住
 
 INTROSPECTION = f"""
 <node>
@@ -42,6 +44,7 @@ INTROSPECTION = f"""
       <arg type="s" name="active" direction="out"/>
     </method>
     <signal name="StatusChanged"><arg type="s" name="json"/></signal>
+    <signal name="PresetChanged"><arg type="s" name="preset"/><arg type="s" name="cause"/></signal>
   </interface>
 </node>
 """
@@ -96,7 +99,8 @@ class Daemon:
             log.warning("无法保存状态: %s", e)
 
     # ---------- 预设 ----------
-    def apply_preset(self, name, persist=True):
+    def apply_preset(self, name, persist=True, cause=None):
+        """cause：user（面板 / fanctl）、external（Fn+Q 等）、ac / battery（插拔电源）；None 不发信号。"""
         p = self.presets[name]
         self.hw.set_extras([])
         if p["profile"]:
@@ -109,6 +113,8 @@ class Daemon:
         if persist:
             self._save_state()
         log.info("应用预设 %s（%s）profile=%s extras=%s", name, p["label"], self.expected_profile, p["extras"])
+        if cause and self.conn:
+            self.conn.emit_signal(None, OBJECT_PATH, IFACE, "PresetChanged", GLib.Variant("(ss)", (name, cause)))
 
     def _follow_profile(self):
         prof = self.hw.get_profile()
@@ -123,15 +129,27 @@ class Daemon:
             target = PROFILE_TO_PRESET.get(prof)
             log.info("电源模式被外部切换为 %s → 预设 %s", prof, target)
             if target:
-                self.apply_preset(target)
+                if self._is_manual_switch(prof):
+                    self.switch.remember(self.switch.source, target)
+                self.apply_preset(target, cause="external")
             else:
                 self.expected_profile = prof
+
+    def _is_manual_switch(self, prof):
+        """外部切换是否算用户的选择（Fn+Q 等）：排除插拔电源过程中与低电量自动省电。"""
+        if not self.switch.settled:
+            return False
+        if self.switch.source == "battery" and prof == "low-power":
+            pct = self._safe(self.hw.battery_percent)
+            if pct is None or pct <= LOW_BATTERY:
+                return False
+        return True
 
     def _follow_source(self, now):
         target = self.switch.step(self.hw.power_source(), now, self.preset)
         if target and target != self.preset and target in self.presets:
             log.info("电源切换为%s → 预设 %s", "插电" if self.switch.source == "ac" else "电池", target)
-            self.apply_preset(target)
+            self.apply_preset(target, cause=self.switch.source)
 
     # ---------- 控制循环 ----------
     def _write(self, target):
@@ -235,7 +253,7 @@ class Daemon:
             elif method == "SetPreset":
                 name = resolve(self.presets, params.unpack()[0])
                 self.switch.remember(self.switch.source, name)      # 手动选择 → 记为当前电源下的预设
-                self.apply_preset(name)
+                self.apply_preset(name, cause="user")
                 self.tick()
                 invocation.return_value(GLib.Variant("(s)", (name,)))
         except KeyError as e:

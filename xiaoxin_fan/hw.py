@@ -176,6 +176,9 @@ class Hardware:
     def power_source(self):
         return read_power_source()
 
+    def battery_percent(self):
+        return read_battery_percent()
+
     def read_temps(self):
         return self.sensors.read()
 
@@ -252,6 +255,17 @@ def read_power_source(base="/sys/class/power_supply"):
         except OSError:
             continue
     return "battery" if found else None
+
+
+def read_battery_percent(base="/sys/class/power_supply"):
+    """电池电量（%），读不到时返回 None。"""
+    for d in glob.glob(f"{base}/BAT*"):
+        try:
+            with open(f"{d}/capacity") as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            continue
+    return None
 
 
 def load_config(path=CONFIG_FILE):

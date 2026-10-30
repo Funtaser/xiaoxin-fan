@@ -211,6 +211,11 @@ class SourceSwitch:
         self._pending = None
         self._since = 0.0
 
+    @property
+    def settled(self):
+        """电源状态稳定（没有正在确认的插拔）。"""
+        return self.source is not None and self._pending is None
+
     def remember(self, source, preset):
         if source in ("ac", "battery"):
             self.remembered[source] = preset
