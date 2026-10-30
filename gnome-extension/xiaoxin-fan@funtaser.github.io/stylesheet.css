@@ -1,0 +1,75 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* 颜色尽量用半透明灰与主题前景色叠加，以同时适配 GNOME 浅色 / 深色主题 */
+
+.xiaoxin-hint {
+  font-size: 0.85em;
+  margin-left: 12px;
+}
+
+.xiaoxin-status {
+  padding: 4px 6px 2px;
+  spacing: 6px;
+}
+
+.xiaoxin-tiles {
+  spacing: 6px;
+}
+
+.xiaoxin-tile {
+  background-color: rgba(128, 128, 128, 0.14);
+  border-radius: 10px;
+  padding: 6px 10px;
+  spacing: 1px;
+}
+
+.xiaoxin-tile-caption {
+  font-size: 0.78em;
+}
+
+.xiaoxin-tile-value {
+  font-size: 1.15em;
+  font-weight: bold;
+}
+
+.xiaoxin-tile-unit {
+  font-size: 0.8em;
+  font-weight: normal;
+}
+
+.xiaoxin-hot {
+  color: #e5a50a;
+}
+
+.xiaoxin-chart {
+  height: 46px;
+  margin-top: 4px;
+}
+
+.xiaoxin-legend {
+  font-size: 0.78em;
+  spacing: 12px;
+}
+
+.xiaoxin-swatch {
+  width: 12px;
+  height: 2px;
+  margin-right: 4px;
+}
+
+.xiaoxin-swatch-temp { background-color: #e8a35c; }
+.xiaoxin-swatch-fan { background-color: #8fa8ff; }
+
+.xiaoxin-note {
+  border-radius: 10px;
+  padding: 6px 10px;
+  spacing: 8px;
+  background-color: rgba(128, 128, 128, 0.14);
+}
+
+.xiaoxin-note-warning {
+  background-color: rgba(229, 165, 10, 0.2);
+}
+
+.xiaoxin-note-warning StIcon {
+  color: #e5a50a;
+}
