@@ -25,7 +25,7 @@ DEFAULT_PRESETS = {
     "battery": {
         "ec_below": 60,
         "label": "续航", "description": "功耗 10–15W，最安静，适合用电池看视频/文档",
-        "profile": "balanced", "extras": ["stp"],
+        "profile": "low-power", "extras": ["stp"],     # STP 在 BIOS 中最后计算，叠加在节能档上同样生效
         "curve": [[0, 2000], [65, 2000], [75, 2600], [85, 3500]],
     },
     "quiet": {

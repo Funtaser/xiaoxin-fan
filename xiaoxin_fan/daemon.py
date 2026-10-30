@@ -5,6 +5,7 @@
   · D-Bus：io.github.XiaoxinFan（系统总线；--fake 时用会话总线）
   · 休眠：持有 logind 延迟锁，休眠前交还 EC，唤醒后重新应用预设
   · 跟随 GNOME 电源菜单：platform_profile 被外部修改时切换到对应预设
+  · 插拔电源：插电 / 电池各记住一个预设，电源稳定变化后自动切换
   · 退出（SIGTERM/SIGINT/异常）：交还 EC
 """
 
@@ -20,7 +21,7 @@ import gi
 gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib  # noqa: E402
 
-from .control import Controller, Curve, PowerGuard  # noqa: E402
+from .control import Controller, Curve, PowerGuard, SourceSwitch  # noqa: E402
 from .hw import HardwareError  # noqa: E402
 from .presets import PROFILE_TO_PRESET, USER_PRESETS, load_presets, resolve  # noqa: E402
 
@@ -54,7 +55,9 @@ class Daemon:
         self.bus_type = bus_type
         self.state_file = state_file
         self.presets = load_presets(presets_path)
-        self.preset = self._load_state()
+        state = self._load_state()
+        self.preset = state["preset"]
+        self.switch = SourceSwitch({k: v for k, v in state["by_source"].items() if v in self.presets})
         self.ctrl = Controller(None)
         self.pguard = PowerGuard()
         self.power_cap = None          # 当前生效的功耗上限（W），None = 原厂
@@ -74,17 +77,20 @@ class Daemon:
     def _load_state(self):
         try:
             with open(self.state_file) as f:
-                name = json.load(f).get("preset", "stock")
-            return name if name in self.presets else "stock"
+                data = json.load(f)
         except (OSError, ValueError):
-            return "stock"
+            data = {}
+        name = data.get("preset", "stock")
+        by_source = data.get("by_source")
+        return {"preset": name if name in self.presets else "stock",
+                "by_source": by_source if isinstance(by_source, dict) else {}}
 
     def _save_state(self):
         try:
             os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
             tmp = self.state_file + ".tmp"
             with open(tmp, "w") as f:
-                json.dump({"preset": self.preset}, f)
+                json.dump({"preset": self.preset, "by_source": self.switch.remembered}, f)
             os.replace(tmp, self.state_file)
         except OSError as e:
             log.warning("无法保存状态: %s", e)
@@ -121,6 +127,12 @@ class Daemon:
             else:
                 self.expected_profile = prof
 
+    def _follow_source(self, now):
+        target = self.switch.step(self.hw.power_source(), now, self.preset)
+        if target and target != self.preset and target in self.presets:
+            log.info("电源切换为%s → 预设 %s", "插电" if self.switch.source == "ac" else "电池", target)
+            self.apply_preset(target)
+
     # ---------- 控制循环 ----------
     def _write(self, target):
         self.hw.set_rpm(target)
@@ -131,6 +143,7 @@ class Daemon:
             return True
         now = time.monotonic()
         try:
+            self._follow_source(now)
             self._follow_profile()
             temps = self.hw.read_temps()
             d = self.ctrl.step(temps, now)
@@ -185,6 +198,7 @@ class Daemon:
             "target": self.written, "reason": d.reason if d else "error",
             "pkg_w": self._safe(self.hw.package_watts),
             "power_cap": self.power_cap,
+            "source": self.switch.source, "by_source": self.switch.remembered,
             "paused": self.paused, "error": self.error, "time": time.time(),
         }
         if self.conn:
@@ -220,6 +234,7 @@ class Daemon:
                 invocation.return_value(GLib.Variant("(s)", (json.dumps(data, ensure_ascii=False),)))
             elif method == "SetPreset":
                 name = resolve(self.presets, params.unpack()[0])
+                self.switch.remember(self.switch.source, name)      # 手动选择 → 记为当前电源下的预设
                 self.apply_preset(name)
                 self.tick()
                 invocation.return_value(GLib.Variant("(s)", (name,)))
@@ -285,6 +300,11 @@ class Daemon:
         return False
 
     def run(self):
+        # 开机时按当前电源选预设（例如插电时关机、开机时用电池）
+        src = self._safe(self.hw.power_source)
+        self.switch.step(src, time.monotonic(), self.preset)
+        if src and self.switch.preferred(src, self.preset) in self.presets:
+            self.preset = self.switch.preferred(src, self.preset)
         self.apply_preset(self.preset, persist=False)
         Gio.bus_own_name(self.bus_type, BUS_NAME, Gio.BusNameOwnerFlags.NONE,
                          self._on_bus_acquired, None, self._on_name_lost)

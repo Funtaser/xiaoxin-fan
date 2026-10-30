@@ -105,8 +105,15 @@ echo '\_SB.WM10.WMAE 0 0x12 b0100030400000000' > /proc/acpi/call                
 | IBS | 8 | 7 | 20 / 35 W | 2500 |
 | **GKM**（Windows「极客模式」） | 命令 0x0B | **8** | 70 / 70 W | **4300** |
 
-`FCMO` 可经 `acpi_call` 读取 `\_SB.PC00.LPCB.EC0.FCMO`。BIOS 中计算顺序为 AQM→APM→IBS→IEP→MMC→STP，后者覆盖前者；
+`FCMO` 可经 `acpi_call` 读取 `\_SB.PC00.LPCB.EC0.FCMO`。BIOS 中计算顺序为 AQM→APM→IBS→IEP→MMC→STP，后者覆盖前者
+（实测 low-power + STP 同样得到 FCMO=5、PL 10/15 W，因此「续航」预设用 low-power，系统菜单显示为“节能”）；
 切换 MMC 会重算 FCMO（GKM 被覆盖），所以叠加模式前应先设好 `platform_profile`。
+
+**关闭 GKM 的副作用**：命令 0x0B 在 valid=0 时不重算，而是无条件写 `ODV8=1, FCMO=1`，即性能档的功耗与风扇表。
+如果关 GKM 是最后一步，low-power / balanced 会停在 70/70 W（v0.2.0 的「静音」「均衡」预设即有此问题）。
+正确顺序：先关 GKM，再发其它 DYTC SET（任意一次都会按 MMC 与各功能标志重算 FCMO）。
+
+**Fn+Q**：在 Linux 下按 low-power → balanced → performance 循环，`platform_profile` 同步变化，守护进程随之切换预设。
 
 ## EC 自动风扇逻辑（实测）
 

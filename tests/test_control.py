@@ -7,8 +7,8 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from xiaoxin_fan.control import (Controller, Curve, CPU_HOT_HOLD, INVALID_GRACE,  # noqa: E402
-                                 POWER_MIN_W, POWER_START_W, PowerGuard)
+from xiaoxin_fan.control import (Controller, Curve, CPU_HOT_HOLD, EC_IDLE_MIN_HOLD, INVALID_GRACE,  # noqa: E402
+                                 POWER_MIN_W, POWER_START_W, PowerGuard, SOURCE_SETTLE, SourceSwitch)
 from xiaoxin_fan.hw import check_model, read_dmi  # noqa: E402
 from xiaoxin_fan.presets import DEFAULT_PRESETS, load_presets, resolve  # noqa: E402
 
@@ -116,10 +116,32 @@ class EcIdleTest(unittest.TestCase):
 
     def test_hysteresis_band_keeps_state(self):
         c = Controller(CURVE, ec_below=55)
-        run(c, [60] * 10)                                       # 接管
-        self.assertEqual(run(c, [54] * 10, t0=10)[-1].reason, "curve")   # 54 > 53：仍接管
-        self.assertEqual(run(c, [50] * 10, t0=20)[-1].target, 0)         # 50 < 53：交出
-        self.assertEqual(run(c, [54] * 10, t0=30)[-1].target, 0)         # 54 < 55：仍交出
+        run(c, [60] * 30)                                                   # 接管
+        self.assertEqual(run(c, [52] * 100, t0=30)[-1].reason, "curve")     # 52 > 50：仍接管
+        self.assertEqual(run(c, [45] * 60, t0=130)[-1].target, 0)           # 45 < 50 且已保持 60 s：交出
+        self.assertEqual(run(c, [54] * 60, t0=190)[-1].target, 0)           # 54 < 55：仍交出
+
+    def test_spike_does_not_take_over(self):
+        c = Controller(CURVE, ec_below=50)
+        run(c, [42] * 10)
+        out = run(c, [42, 42, 56, 42, 42, 55, 42, 42], t0=10)              # 短时尖峰
+        self.assertTrue(all(d.reason == "ec-idle" for d in out))
+
+    def test_real_load_takes_over_fast(self):
+        c = Controller(CURVE, ec_below=50)
+        run(c, [42] * 10)
+        self.assertEqual(c.step({"cpu": 42}, 10).reason, "ec-idle")
+        out = run(c, [75] * 6, t0=11)
+        self.assertEqual(out[-1].reason, "curve")
+        self.assertGreater(out[-1].target, 0)
+
+    def test_min_hold_prevents_flapping(self):
+        c = Controller(CURVE, ec_below=50)
+        self.assertEqual(run(c, [42] * 10)[-1].reason, "ec-idle")          # 交给 EC
+        run(c, [56] * 20, t0=10)                                            # 接管
+        out = run(c, [40] * (int(EC_IDLE_MIN_HOLD) - 25), t0=30)            # 很快降温，但未满保持时间
+        self.assertTrue(all(d.reason == "curve" for d in out))
+        self.assertEqual(run(c, [40] * 10, t0=70)[-1].reason, "ec-idle")    # 满 60 s 后交出
 
     def test_guard_overrides_ec_idle(self):
         d = run(Controller(CURVE, ec_below=55), [{"cpu": 40, "nvme0": 82}] * 3)[-1]
@@ -158,6 +180,40 @@ class PowerGuardTest(unittest.TestCase):
         self.feed(g, [85] * 3)
         cap = g.cap
         self.assertEqual(g.step({"cpu": 90}, 10), round(cap))
+
+
+class SourceSwitchTest(unittest.TestCase):
+    def feed(self, sw, seq, current, t0=0.0):
+        """按 1 秒间隔喂入电源序列，返回每步结果。"""
+        return [sw.step(src, t0 + i, current) for i, src in enumerate(seq)]
+
+    def test_first_reading_only_records(self):
+        sw = SourceSwitch()
+        self.assertIsNone(sw.step("battery", 0, "geek"))
+        self.assertEqual(sw.source, "battery")
+
+    def test_switch_after_settle_with_memory(self):
+        sw = SourceSwitch({"ac": "geek", "battery": "quiet"})
+        out = self.feed(sw, ["ac"] + ["battery"] * (int(SOURCE_SETTLE) + 2), "geek")
+        self.assertEqual([o for o in out if o], ["quiet"])
+        self.assertEqual(sw.source, "battery")
+
+    def test_bounce_does_not_switch(self):
+        sw = SourceSwitch({"battery": "quiet"})
+        out = self.feed(sw, ["ac", "battery", "ac", "battery", "ac", "ac"], "geek")
+        self.assertEqual([o for o in out if o], [])
+        self.assertEqual(sw.source, "ac")
+
+    def test_battery_default(self):
+        self.assertEqual(SourceSwitch().preferred("battery", "geek"), "balanced")
+        self.assertEqual(SourceSwitch().preferred("battery", "quiet"), "quiet")
+        self.assertEqual(SourceSwitch().preferred("ac", "quiet"), "quiet")
+
+    def test_unknown_source_ignored(self):
+        sw = SourceSwitch({"battery": "quiet"})
+        self.assertEqual([o for o in self.feed(sw, [None] * 6, "geek") if o], [])
+        sw.remember(None, "geek")
+        self.assertEqual(sw.remembered, {"battery": "quiet"})
 
 
 class ModelCheckTest(unittest.TestCase):

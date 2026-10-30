@@ -133,10 +133,14 @@ class Hardware:
             f.write(profile)
 
     def set_extras(self, extras):
-        """关闭全部 DYTC 附加功能，再开启 extras 中列出的（stp/apm/aqm/iep/ibs/gkm）。"""
+        """关闭全部 DYTC 附加功能，再开启 extras 中列出的（stp/apm/aqm/iep/ibs/gkm）。
+
+        GKM 必须最先关：BIOS 关 GKM 时会无条件写 FCMO=1（性能档的功耗与风扇表）。
+        之后每次 DYTC SET 都会按 platform_profile 和各功能标志重新计算 FCMO，从而回到正确的档位。
+        """
+        _acpi(f"{DYTC} {0x00B | 1 << 12 | 0xF << 16:#x}")             # GKM 关
         for name, func in DYTC_FUNCS.items():
             _acpi(f"{DYTC} {0x001 | func << 12 | 0xF << 16:#x}")
-        _acpi(f"{DYTC} {0x00B | 1 << 12 | 0xF << 16:#x}")             # GKM 关
         for name in extras:
             if name == "gkm":
                 _acpi(f"{DYTC} {0x00B | 1 << 12 | 0xF << 16 | 1 << 20:#x}")
@@ -169,6 +173,9 @@ class Hardware:
             raise HardwareError(f"无法设置功耗上限（可能被 BIOS 锁定）: {e}") from e
 
     # ---- 读数 ----
+    def power_source(self):
+        return read_power_source()
+
     def read_temps(self):
         return self.sensors.read()
 
@@ -228,6 +235,23 @@ class SensorSet:
 
 
 CONFIG_FILE = "/etc/xiaoxin-fan/config.json"
+
+
+def read_power_source(base="/sys/class/power_supply"):
+    """"ac" / "battery"；没有 Mains 类电源时返回 None。"""
+    found = False
+    for d in glob.glob(f"{base}/*"):
+        try:
+            with open(f"{d}/type") as f:
+                if f.read().strip() != "Mains":
+                    continue
+            found = True
+            with open(f"{d}/online") as f:
+                if f.read().strip() == "1":
+                    return "ac"
+        except OSError:
+            continue
+    return "battery" if found else None
 
 
 def load_config(path=CONFIG_FILE):

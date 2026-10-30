@@ -19,7 +19,12 @@ INVALID_GRACE = 5.0       # 传感器连续无效超过此秒数 → 交还 EC
 CPU_HOT = 98.0            # CPU 持续高于此温度……
 CPU_HOT_HOLD = 20.0       # ……超过此秒数，则风扇不低于 CPU_HOT_FLOOR
 CPU_HOT_FLOOR = 4500
-EC_IDLE_HYST = 2.0        # 低温交给 EC 的回差：低于 ec_below-2 交出，回到 ec_below 再接管
+# 低温交给 EC：EC 接手后风扇可能停转、温度回升，我们接管后至少 2000 rpm、温度又回落——
+# 回差太窄时会在两者之间来回跳。因此用慢速平滑温度判断，加宽回差，并要求接管后至少保持一段时间。
+EC_IDLE_HYST = 5.0        # 低于 ec_below-5 才交出，回到 ec_below 再接管
+EC_IDLE_ALPHA = 0.1       # 判断用的慢速平滑（约 10 s），单次尖峰几乎不影响
+EC_IDLE_MIN_HOLD = 60.0   # 接管后至少保持这么多秒才可能交出
+EC_IDLE_FAST = 10.0       # 快速平滑温度超过 ec_below+10（真实负载）时立即接管，不等慢速平滑
 
 # (传感器前缀, 温度阈值, 转速下限)
 # SEN1 紧贴 CPU/供电，随功耗快速升温；原厂 EC 在 4 线程负载下让它到 73°C+ 仍只开 3900，
@@ -71,6 +76,8 @@ class Controller:
     curve: Curve | None          # None = 原厂模式（全程交给 EC）
     ec_below: float | None = None  # 平滑 CPU 温度低于此值时交给 EC（EC 低温时可让风扇停转）
     _ec_idle: bool = False
+    _idle_ema: float | None = None
+    _taken_at: float | None = None
     _ema: float | None = None
     _last: int = 0
     _last_time: float | None = None
@@ -80,6 +87,7 @@ class Controller:
 
     def reset(self):
         self._ema = self._last_time = self._invalid_since = self._hot_since = self._eval_temp = None
+        self._idle_ema = self._taken_at = None
         self._last = 0
         self._ec_idle = False
 
@@ -99,6 +107,7 @@ class Controller:
             self._invalid_since = None
 
         self._ema = cpu if self._ema is None else self._ema + EMA_ALPHA * (cpu - self._ema)
+        self._idle_ema = cpu if self._idle_ema is None else self._idle_ema + EC_IDLE_ALPHA * (cpu - self._idle_ema)
 
         # 曲线 + 回差：升温立即跟随；降温要多降 HYSTERESIS 度才跟随
         if self._eval_temp is None or self._ema >= self._eval_temp:
@@ -122,15 +131,17 @@ class Controller:
 
         # 低温交给 EC；任何安全保护生效时都不交出
         if self.ec_below is not None and reason == "curve":
-            if self._ema < self.ec_below - EC_IDLE_HYST:
+            if self._ec_idle:
+                if self._idle_ema >= self.ec_below or self._ema >= self.ec_below + EC_IDLE_FAST:
+                    self._ec_idle, self._taken_at = False, now
+            elif self._idle_ema < self.ec_below - EC_IDLE_HYST and (
+                    self._taken_at is None or now - self._taken_at >= EC_IDLE_MIN_HOLD):
                 self._ec_idle = True
-            elif self._ema >= self.ec_below:
-                self._ec_idle = False
             if self._ec_idle:
                 self._last, self._last_time = 0, now
                 return Decision(0, "ec-idle", round(self._ema, 1))
-        else:
-            self._ec_idle = False
+        elif self._ec_idle:                      # 安全保护生效：立即接管
+            self._ec_idle, self._taken_at = False, now
 
         # 降速限速（升速不限，安全优先）
         if self._last and self._last_time is not None and target < self._last:
@@ -179,3 +190,54 @@ class PowerGuard:
             if self.cap >= POWER_START_W:
                 self.cap = None
         return None if self.cap is None else round(self.cap)
+
+
+# ---------- 插拔电源自动切换 ----------
+SOURCE_SETTLE = 3.0       # 电源状态稳定这么多秒才算插拔（PD 协商、接口松动时会抖动）
+# 从没给电池选过预设时：高功耗预设拔电后默认降到「均衡」，其它保持不变
+BATTERY_DEFAULTS = {"performance": "balanced", "geek": "balanced"}
+
+
+class SourceSwitch:
+    """插电 / 电池各记住一个预设；电源稳定变化后返回应切换到的预设。
+
+    source 取值 "ac" / "battery"，None 表示无法判断（不切换）。
+    """
+
+    def __init__(self, remembered=None, settle=SOURCE_SETTLE):
+        self.remembered = {k: v for k, v in (remembered or {}).items() if k in ("ac", "battery") and v}
+        self.settle = settle
+        self.source = None         # 已确认的电源
+        self._pending = None
+        self._since = 0.0
+
+    def remember(self, source, preset):
+        if source in ("ac", "battery"):
+            self.remembered[source] = preset
+
+    def preferred(self, source, current):
+        """在 source 下应使用的预设（没有记录时按默认规则）。"""
+        if source in self.remembered:
+            return self.remembered[source]
+        if source == "battery":
+            return BATTERY_DEFAULTS.get(current, current)
+        return current
+
+    def step(self, source, now, current):
+        """喂入当前电源；确认发生插拔时返回目标预设，否则返回 None。"""
+        if source is None:
+            self._pending = None
+            return None
+        if self.source is None:          # 首次：只记录，不切换
+            self.source = source
+            return None
+        if source == self.source:
+            self._pending = None
+            return None
+        if source != self._pending:
+            self._pending, self._since = source, now
+            return None
+        if now - self._since < self.settle:
+            return None
+        self.source, self._pending = source, None
+        return self.preferred(source, current)

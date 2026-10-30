@@ -50,6 +50,10 @@ def fmt(s):
         (f"功耗     {w:.1f} W" if isinstance(w, (int, float)) else "功耗     -")
         + (f"   功耗保护：上限 {s['power_cap']} W（主板温度过高）" if s.get("power_cap") else ""),
     ]
+    if s.get("source"):
+        names = {"ac": "插电", "battery": "电池"}
+        mem = s.get("by_source") or {}
+        lines.append(f"电源     {names.get(s['source'], s['source'])}   记住的预设：插电 {mem.get('ac', '-')} / 电池 {mem.get('battery', '-')}")
     if s.get("paused"):
         lines.append("状态     已暂停（休眠/退出中）")
     if s.get("error"):
