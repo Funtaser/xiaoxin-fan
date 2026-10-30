@@ -7,7 +7,8 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from xiaoxin_fan.control import Controller, Curve, CPU_HOT_HOLD, INVALID_GRACE  # noqa: E402
+from xiaoxin_fan.control import (Controller, Curve, CPU_HOT_HOLD, INVALID_GRACE,  # noqa: E402
+                                 POWER_MIN_W, POWER_START_W, PowerGuard)
 from xiaoxin_fan.hw import check_model, read_dmi  # noqa: E402
 from xiaoxin_fan.presets import DEFAULT_PRESETS, load_presets, resolve  # noqa: E402
 
@@ -123,6 +124,40 @@ class EcIdleTest(unittest.TestCase):
     def test_guard_overrides_ec_idle(self):
         d = run(Controller(CURVE, ec_below=55), [{"cpu": 40, "nvme0": 82}] * 3)[-1]
         self.assertEqual((d.target, d.reason), (6000, "guard:nvme0"))
+
+
+class PowerGuardTest(unittest.TestCase):
+    def feed(self, g, sens, t0=0):
+        return [g.step({"cpu": 90, "sen1": s, "sen3": None}, t0 + i) for i, s in enumerate(sens)]
+
+    def test_idle_below_limit_no_cap(self):
+        self.assertEqual(self.feed(PowerGuard(), [70] * 10)[-1], None)
+
+    def test_engages_and_lowers_faster_when_hotter(self):
+        g = PowerGuard()
+        slow = self.feed(g, [81] * 5)
+        self.assertEqual(slow[0], POWER_START_W - 2)
+        self.assertEqual(slow[-1], POWER_START_W - 10)
+        fast = self.feed(g, [87] * 3, t0=5)
+        self.assertEqual(slow[-1] - fast[-1], 15)
+
+    def test_floor(self):
+        self.assertEqual(self.feed(PowerGuard(), [95] * 60)[-1], POWER_MIN_W)
+
+    def test_holds_in_band_then_releases_fully(self):
+        g = PowerGuard()
+        self.feed(g, [85] * 4)
+        held = self.feed(g, [78] * 10, t0=4)                 # 77 < 78 < 80：保持
+        self.assertEqual(len(set(held)), 1)
+        rel = self.feed(g, [70] * 200, t0=14)
+        self.assertEqual(rel[-1], None)                      # 放开到原值后撤销限制
+        self.assertTrue(all(b is None or a is None or b >= a for a, b in zip(rel, rel[1:])))
+
+    def test_missing_sensor_keeps_state(self):
+        g = PowerGuard()
+        self.feed(g, [85] * 3)
+        cap = g.cap
+        self.assertEqual(g.step({"cpu": 90}, 10), round(cap))
 
 
 class ModelCheckTest(unittest.TestCase):

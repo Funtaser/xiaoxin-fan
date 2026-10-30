@@ -23,8 +23,8 @@ EC_IDLE_HYST = 2.0        # 低温交给 EC 的回差：低于 ec_below-2 交出
 
 # (传感器前缀, 温度阈值, 转速下限)
 # SEN1 紧贴 CPU/供电，随功耗快速升温；原厂 EC 在 4 线程负载下让它到 73°C+ 仍只开 3900，
-# BIOS 散热表：SEN 过热 75 / 临界 80（Linux 到临界会关机）。风扇对 SEN1 影响有限（6000 比 3900 仅低约 2°C），
-# 所以只在原厂工作区间之上介入。NVMe 警告 83.85。
+# BIOS 散热表：SEN 过热 75 / 临界 80（Linux 不轮询该温区，越过临界也不会关机）。风扇对 SEN1 影响有限
+# （6000 比 3900 仅低约 2–4°C），所以风扇只在原厂工作区间之上介入，真正压住 SEN1 靠下方的 PowerGuard。NVMe 警告 83.85。
 GUARDS = (
     ("sen", 76.0, MAX_RPM),
     ("sen", 72.0, 4500),
@@ -140,3 +140,42 @@ class Controller:
         target = min(MAX_RPM, max(MIN_MANUAL_RPM, quantize(target)))
         self._last, self._last_time = target, now
         return Decision(target, reason, round(self._ema, 1))
+
+
+# ---------------------------------------------------------------------------
+# 功耗保护：SEN1 紧贴 CPU/供电，风扇压不住它（满载 6000 rpm 仍到 87°C，原厂 3900 rpm 时 91°C）。
+# 仿照 Windows 上 Intel DTT 的做法，SEN 持续超过 BIOS 临界线时逐步降低 CPU 功耗上限。
+POWER_SEN_LIMIT = 80.0     # BIOS 散热表中 SEN 的临界温度
+POWER_RELEASE_HYST = 3.0   # 回落到 limit-3 以下才开始放开
+POWER_START_W = 70.0       # 介入时的起点（performance 档 EC 设定的 PL1）
+POWER_MIN_W = 35.0
+POWER_DOWN_W_S = 2.0       # ≥ limit 时每秒下调
+POWER_DOWN_FAST_W_S = 5.0  # ≥ limit+5 时每秒下调
+POWER_UP_W_S = 0.5         # ≤ limit-3 时每秒放开
+
+
+@dataclass
+class PowerGuard:
+    limit: float = POWER_SEN_LIMIT
+    cap: float | None = None          # None = 不限制（保持原厂功耗上限）
+    _last_time: float | None = None
+
+    def reset(self):
+        self.cap = self._last_time = None
+
+    def step(self, temps, now):
+        """返回本周期的功耗上限（整数瓦）或 None。"""
+        sens = [t for n, t in temps.items() if n.startswith("sen") and t is not None]
+        dt = 0.0 if self._last_time is None else min(max(now - self._last_time, 0.0), 2.0)
+        self._last_time = now
+        if not sens:                       # 读不到：保持现状
+            return None if self.cap is None else round(self.cap)
+        sen = max(sens)
+        if sen >= self.limit:
+            rate = POWER_DOWN_FAST_W_S if sen >= self.limit + 5 else POWER_DOWN_W_S
+            self.cap = max(POWER_MIN_W, (self.cap if self.cap is not None else POWER_START_W) - rate * max(dt, 1.0))
+        elif self.cap is not None and sen <= self.limit - POWER_RELEASE_HYST:
+            self.cap += POWER_UP_W_S * dt
+            if self.cap >= POWER_START_W:
+                self.cap = None
+        return None if self.cap is None else round(self.cap)

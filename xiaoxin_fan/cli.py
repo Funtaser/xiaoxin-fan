@@ -47,7 +47,8 @@ def fmt(s):
         f"预设     {s['label']}（{s['preset']}）   EC 档位 {s.get('profile')} {'+' + '+'.join(s['extras']) if s.get('extras') else ''}  FCMO={s.get('fcmo')}",
         f"风扇     {fans[0]} / {fans[1]} rpm   目标 {tgt}   {reason_text(s.get('reason'))}",
         f"温度     {temps}",
-        f"功耗     {w:.1f} W" if isinstance(w, (int, float)) else "功耗     -",
+        (f"功耗     {w:.1f} W" if isinstance(w, (int, float)) else "功耗     -")
+        + (f"   功耗保护：上限 {s['power_cap']} W（主板温度过高）" if s.get("power_cap") else ""),
     ]
     if s.get("paused"):
         lines.append("状态     已暂停（休眠/退出中）")

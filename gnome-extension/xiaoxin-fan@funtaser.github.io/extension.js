@@ -179,6 +179,8 @@ const FanToggle = GObject.registerClass({
             `风扇 ${fansText(s)}   ${s.target ? `目标 ${s.target}` : ''}`,
             `${reasonText(s.reason)}${typeof s.pkg_w === 'number' ? `   功耗 ${s.pkg_w.toFixed(1)} W` : ''}`,
         ];
+        if (s.power_cap)
+            lines.push(`功耗保护：主板温度过高，上限 ${s.power_cap} W`);
         if (s.error)
             lines.push(`错误：${s.error}`);
         this._infoItem.label.text = lines.join('\n');

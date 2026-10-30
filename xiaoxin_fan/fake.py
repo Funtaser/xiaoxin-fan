@@ -16,6 +16,7 @@ class FakeHardware:
         self.target = 0
         self.rpm = [2300.0, 2200.0]
         self._t0 = self._last = time.monotonic()
+        self.power_cap = None
 
     def _cpu(self):
         # 60 秒周期的负载起伏；风扇越快温度越低
@@ -60,5 +61,9 @@ class FakeHardware:
     def read_temps(self):
         return {"cpu": round(self._cpu(), 1), "sen1": 41.0, "sen2": 42.0, "sen3": None, "nvme0": 33.0}
 
+    def set_power_cap(self, watts):
+        self.power_cap = watts
+
     def package_watts(self):
-        return round(10 + (self._cpu() - 45) * 1.1, 1)
+        w = 10 + (self._cpu() - 45) * 1.1
+        return round(min(w, self.power_cap) if self.power_cap else w, 1)

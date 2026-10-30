@@ -20,7 +20,7 @@ import gi
 gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib  # noqa: E402
 
-from .control import Controller, Curve  # noqa: E402
+from .control import Controller, Curve, PowerGuard  # noqa: E402
 from .hw import HardwareError  # noqa: E402
 from .presets import PROFILE_TO_PRESET, USER_PRESETS, load_presets, resolve  # noqa: E402
 
@@ -56,6 +56,9 @@ class Daemon:
         self.presets = load_presets(presets_path)
         self.preset = self._load_state()
         self.ctrl = Controller(None)
+        self.pguard = PowerGuard()
+        self.power_cap = None          # 当前生效的功耗上限（W），None = 原厂
+        self.power_guard_ok = True     # 写入失败（如被 BIOS 锁定）后关闭功耗保护
         self.written = None
         self.last_write = 0.0
         self.expected_profile = None
@@ -133,6 +136,7 @@ class Daemon:
             d = self.ctrl.step(temps, now)
             if d.target != self.written or (d.target and now - self.last_write >= REWRITE_INTERVAL):
                 self._write(d.target)
+            self._power_step(temps, now)
             fans = self.hw.read_rpm()
             self.error = None
             self._publish(temps, d, fans)
@@ -148,6 +152,28 @@ class Daemon:
             self._publish({}, None, None)
         return True
 
+    def _set_power_cap(self, cap):
+        if cap == self.power_cap:
+            return
+        try:
+            self.hw.set_power_cap(cap)
+        except Exception as e:  # noqa: BLE001 —— 功耗保护失败不应影响风扇控制
+            log.error("功耗保护不可用，已关闭: %s", e)
+            self.power_guard_ok = False
+            self.pguard.reset()
+            return
+        if cap is None:
+            log.info("SEN 已回落，功耗上限恢复原厂")
+        elif self.power_cap is None or abs(cap - self.power_cap) >= 5:
+            log.info("SEN 超过 %.0f°C → 功耗上限 %dW", self.pguard.limit, cap)
+        self.power_cap = cap
+
+    def _power_step(self, temps, now):
+        if self.preset == "stock" or not self.power_guard_ok:
+            self._set_power_cap(None)
+            return
+        self._set_power_cap(self.pguard.step(temps, now))
+
     def _publish(self, temps, d, fans):
         p = self.presets[self.preset]
         self.status = {
@@ -158,6 +184,7 @@ class Daemon:
             "fans": list(fans) if fans else None,
             "target": self.written, "reason": d.reason if d else "error",
             "pkg_w": self._safe(self.hw.package_watts),
+            "power_cap": self.power_cap,
             "paused": self.paused, "error": self.error, "time": time.time(),
         }
         if self.conn:
@@ -172,6 +199,8 @@ class Daemon:
             return None
 
     def release(self, why):
+        self.pguard.reset()
+        self._set_power_cap(None)
         try:
             self.hw.release()
             self.written = 0

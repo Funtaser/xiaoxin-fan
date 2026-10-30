@@ -15,7 +15,9 @@ import time
 
 ACPI_CALL = "/proc/acpi/call"
 PLATFORM_PROFILE = "/sys/firmware/acpi/platform_profile"
-RAPL_ENERGY = "/sys/class/powercap/intel-rapl:0/energy_uj"
+RAPL = "/sys/class/powercap/intel-rapl:0"          # MSR 域；EC 只改写 MMIO 域，不碰这里
+RAPL_ENERGY = f"{RAPL}/energy_uj"
+POWER_STATE = "/var/lib/xiaoxin-fan/power-original.json"   # 下调前的原始 PL1/PL2，崩溃后据此恢复
 
 WMAE = r"\_SB.WM10.WMAE"
 DYTC = r"\_SB.PC00.LPCB.EC0.VPC0.DYTC"
@@ -146,6 +148,26 @@ class Hardware:
     def fcmo(self):
         return _acpi(FCMO)
 
+    # ---- 功耗上限（MSR PL1/PL2）----
+    def set_power_cap(self, watts):
+        """watts=None 恢复原始上限；否则把 PL1、PL2 都设为 watts。"""
+        import json
+        if watts is None:
+            restore_power_limits()
+            return
+        if not os.path.exists(POWER_STATE):
+            orig = [int(open(f"{RAPL}/constraint_{i}_power_limit_uw").read()) for i in (0, 1)]
+            os.makedirs(os.path.dirname(POWER_STATE), exist_ok=True)
+            with open(POWER_STATE, "w") as f:
+                json.dump({"pl1_uw": orig[0], "pl2_uw": orig[1]}, f)
+        uw = int(watts * 1_000_000)
+        try:
+            for i in (0, 1):
+                with open(f"{RAPL}/constraint_{i}_power_limit_uw", "w") as f:
+                    f.write(str(uw))
+        except OSError as e:
+            raise HardwareError(f"无法设置功耗上限（可能被 BIOS 锁定）: {e}") from e
+
     # ---- 读数 ----
     def read_temps(self):
         return self.sensors.read()
@@ -217,12 +239,32 @@ def load_config(path=CONFIG_FILE):
         return {}
 
 
+def restore_power_limits():
+    """若曾下调过功耗上限，按保存的原始值恢复。返回是否做了恢复。"""
+    import json
+    try:
+        with open(POWER_STATE) as f:
+            orig = json.load(f)
+    except (OSError, ValueError):
+        return False
+    for i, key in ((0, "pl1_uw"), (1, "pl2_uw")):
+        with open(f"{RAPL}/constraint_{i}_power_limit_uw", "w") as f:
+            f.write(str(int(orig[key])))
+    os.remove(POWER_STATE)
+    return True
+
+
 def release_now():
-    """systemd ExecStopPost 兜底：交还 EC 并关闭附加模式。"""
+    """systemd ExecStopPost 兜底：交还 EC、关闭附加模式、恢复功耗上限。"""
+    try:
+        if restore_power_limits():
+            print("功耗上限已恢复")
+    except Exception as e:  # noqa: BLE001 —— 兜底路径，尽力而为
+        print(f"恢复功耗上限失败: {e}")
     try:
         hw = Hardware(allow_untested=load_config().get("allow_untested_model", False))
         hw.release()
         hw.set_extras([])
         print("风扇已交还 EC 自动控制")
-    except Exception as e:  # noqa: BLE001 —— 兜底路径，尽力而为
+    except Exception as e:  # noqa: BLE001
         print(f"交还 EC 失败: {e}")
