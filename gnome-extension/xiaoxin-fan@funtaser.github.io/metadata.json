@@ -1,0 +1,10 @@
+{
+  "uuid": "xiaoxin-fan@funtaser.github.io",
+  "name": "小新风扇控制",
+  "description": "在快捷设置中切换 xiaoxin-fand 风扇预设，并显示温度与风扇转速。需要先安装 xiaoxin-fan 守护进程。",
+  "shell-version": [
+    "50"
+  ],
+  "version": 1,
+  "url": "https://github.com/Funtaser/xiaoxin-fan"
+}

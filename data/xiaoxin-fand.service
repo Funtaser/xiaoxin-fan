@@ -1,0 +1,22 @@
+[Unit]
+Description=小新风扇控制守护进程（xiaoxin-fan）
+After=power-profiles-daemon.service systemd-modules-load.service
+Wants=power-profiles-daemon.service
+
+[Service]
+Type=dbus
+BusName=io.github.XiaoxinFan
+ExecStartPre=/usr/sbin/modprobe acpi_call
+ExecStart=/opt/xiaoxin-fan/bin/xiaoxin-fand
+# 无论守护进程如何退出（含崩溃），都把风扇交还给 EC
+ExecStopPost=/opt/xiaoxin-fan/bin/xiaoxin-fand --release
+Restart=on-failure
+RestartSec=3
+StateDirectory=xiaoxin-fan
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

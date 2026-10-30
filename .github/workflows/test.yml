@@ -1,0 +1,20 @@
+name: test
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 单元测试
+        run: python3 -m unittest discover -s tests -v
+      - name: Shell 语法
+        run: for f in install.sh uninstall.sh gnome-extension/install.sh tools/*.sh; do bash -n "$f"; done
+      - name: 扩展 JS 语法
+        run: cp gnome-extension/*@*/extension.js /tmp/ext.mjs && node --check /tmp/ext.mjs
+      - name: D-Bus 策略 XML
+        run: python3 -c "import xml.dom.minidom; xml.dom.minidom.parse('data/io.github.XiaoxinFan.conf')"
