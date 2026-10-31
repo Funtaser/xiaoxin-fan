@@ -155,41 +155,75 @@ class Controller:
 
 # ---------------------------------------------------------------------------
 # 功耗保护：SEN1 紧贴 CPU/供电，风扇压不住它（满载 6000 rpm 仍到 87°C，原厂 3900 rpm 时 91°C）。
-# 仿照 Windows 上 Intel DTT 的做法，SEN 持续超过 BIOS 临界线时逐步降低 CPU 功耗上限。
+# 仿照 Windows 上 Intel DTT 的做法，SEN 接近 BIOS 临界线时调节 CPU 功耗上限，把它稳在目标温度。
+#
+# 速度型 PI：cap -= KP·Δe + KI·e·dt（e = SEN − 目标）。由极客满载闭环数据拟合：SEN1 对功耗的响应为
+# 死区 2 s、时间常数 5 s、0.74°C/W，另有约 +1.9°C/min 的缓慢热积累；不限制时短时功耗约 80 W。
+# 旧的阶梯式调节在负载开始时冲到 85°C，之后在 73–80°C 间锯齿摆动。这里按升温速度预测，预计会越过
+# 临界线时提前介入，起点直接取“当前功耗 − 预计超出量 / 增益”。参数在模型增益 +30%、死区 3 s 时仍不振荡。
 POWER_SEN_LIMIT = 80.0     # BIOS 散热表中 SEN 的临界温度
-POWER_RELEASE_HYST = 3.0   # 回落到 limit-3 以下才开始放开
-POWER_START_W = 70.0       # 介入时的起点（performance 档 EC 设定的 PL1）
+POWER_SEN_TARGET = 79.0    # PI 目标
+POWER_KP = 1.2             # W/°C
+POWER_KI = 0.25            # W/(°C·s)
+POWER_LEAD = 4.0           # 预测温度 = SEN + LEAD × 每秒升温（取最近 3 s）
+POWER_PREDICT_FROM = 72.0  # 低于此温度不做预测介入
+POWER_GAIN = 0.8           # °C/W，估算介入起点用
+POWER_MAX_OVERSHOOT = 10.0 # 预测超出量上限：SEN1 读数偶有一秒跳 8°C，线性外推不能无限放大
+POWER_TRACK_MARGIN = 3.0   # 上限比实际功耗高出此值以上 = 没在起作用：接近目标时不再放开（防积分饱和）
+POWER_HARD = 85.0          # SEN ≥ 此温度时……
+POWER_HARD_W_S = 5.0       # ……每秒至少降这么多
+POWER_START_W = 70.0       # 上限回到此值即撤销限制（performance 档 EC 设定的 PL1）
+POWER_RELEASE_BELOW = 3.0  # ……且 SEN 低于目标这么多度
 POWER_MIN_W = 35.0
-POWER_DOWN_W_S = 2.0       # ≥ limit 时每秒下调
-POWER_DOWN_FAST_W_S = 5.0  # ≥ limit+5 时每秒下调
-POWER_UP_W_S = 0.5         # ≤ limit-3 时每秒放开
 
 
 @dataclass
 class PowerGuard:
-    limit: float = POWER_SEN_LIMIT
+    target: float = POWER_SEN_TARGET
     cap: float | None = None          # None = 不限制（保持原厂功耗上限）
     _last_time: float | None = None
+    _e_prev: float | None = None
+    _hist: list = field(default_factory=list)   # 最近 4 秒的 SEN，算升温速度
 
     def reset(self):
-        self.cap = self._last_time = None
+        self.cap = self._last_time = self._e_prev = None
+        self._hist = []
 
-    def step(self, temps, now):
-        """返回本周期的功耗上限（整数瓦）或 None。"""
+    def step(self, temps, now, pkg_w=None):
+        """pkg_w：上一周期的实际封装功耗（W），读不到为 None。返回本周期的功耗上限（整数瓦）或 None。"""
         sens = [t for n, t in temps.items() if n.startswith("sen") and t is not None]
         dt = 0.0 if self._last_time is None else min(max(now - self._last_time, 0.0), 2.0)
         self._last_time = now
         if not sens:                       # 读不到：保持现状
             return None if self.cap is None else round(self.cap)
         sen = max(sens)
-        if sen >= self.limit:
-            rate = POWER_DOWN_FAST_W_S if sen >= self.limit + 5 else POWER_DOWN_W_S
-            self.cap = max(POWER_MIN_W, (self.cap if self.cap is not None else POWER_START_W) - rate * max(dt, 1.0))
-        elif self.cap is not None and sen <= self.limit - POWER_RELEASE_HYST:
-            self.cap += POWER_UP_W_S * dt
-            if self.cap >= POWER_START_W:
+        self._hist = (self._hist + [sen])[-4:]
+        e = sen - self.target
+
+        if self.cap is None:
+            rate = max(0.0, (self._hist[-1] - self._hist[0]) / max(1, len(self._hist) - 1))
+            pred = sen + POWER_LEAD * rate
+            if sen < self.target and not (sen >= POWER_PREDICT_FROM and pred >= POWER_SEN_LIMIT):
+                self._e_prev = e
+                return None
+            base = pkg_w if pkg_w is not None else POWER_START_W - 2     # 读不到功耗：起点也要低于原厂上限
+            over = min(POWER_MAX_OVERSHOOT, max(0.0, pred - self.target))
+            cap = min(POWER_START_W - 2, base - over / POWER_GAIN)
+        else:
+            de = 0.0 if self._e_prev is None else e - self._e_prev
+            cap = self.cap - (POWER_KP * de + POWER_KI * e * dt)
+            if cap > self.cap and e > -POWER_RELEASE_BELOW and pkg_w is not None and self.cap >= pkg_w + POWER_TRACK_MARGIN:
+                cap = self.cap
+            if sen >= POWER_HARD:
+                cap = min(cap, self.cap - POWER_HARD_W_S * max(dt, 1.0))
+        self._e_prev = e
+        self.cap = max(POWER_MIN_W, cap)
+        if self.cap >= POWER_START_W - 0.5:
+            if e <= -POWER_RELEASE_BELOW:
                 self.cap = None
-        return None if self.cap is None else round(self.cap)
+                return None
+            self.cap = POWER_START_W - 1     # 不受限时实际可到 80 W（PL2）：接近目标时不撤销，否则一放开就冲过头
+        return round(self.cap)
 
 
 # ---------- 插拔电源自动切换 ----------

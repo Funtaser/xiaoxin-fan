@@ -71,6 +71,9 @@ class FakeHardware:
     def set_power_cap(self, watts):
         self.power_cap = watts
 
+    def power_limits(self):
+        return {"msr": self.power_cap or 200.0, "mmio": 70.0}
+
     def package_watts(self):
         w = 10 + (self._cpu() - 45) * 1.1
         return round(min(w, self.power_cap) if self.power_cap else w, 1)

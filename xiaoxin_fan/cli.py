@@ -48,7 +48,7 @@ def fmt(s):
         f"风扇     {fans[0]} / {fans[1]} rpm   目标 {tgt}   {reason_text(s.get('reason'))}",
         f"温度     {temps}",
         (f"功耗     {w:.1f} W" if isinstance(w, (int, float)) else "功耗     -")
-        + (f"   功耗保护：上限 {s['power_cap']} W（主板温度过高）" if s.get("power_cap") else ""),
+        + (f"   功耗保护：上限 {s['power_cap']} W（主板温度接近 80°C）" if s.get("power_cap") else ""),
     ]
     if s.get("source"):
         names = {"ac": "插电", "battery": "电池"}

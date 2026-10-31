@@ -17,6 +17,7 @@ ACPI_CALL = "/proc/acpi/call"
 PLATFORM_PROFILE = "/sys/firmware/acpi/platform_profile"
 RAPL = "/sys/class/powercap/intel-rapl:0"          # MSR 域；EC 只改写 MMIO 域，不碰这里
 RAPL_ENERGY = f"{RAPL}/energy_uj"
+RAPL_MMIO = "/sys/class/powercap/intel-rapl-mmio:0"   # EC 切换档位时改写的域（只读）
 POWER_STATE = "/var/lib/xiaoxin-fan/power-original.json"   # 下调前的原始 PL1/PL2，崩溃后据此恢复
 
 WMAE = r"\_SB.WM10.WMAE"
@@ -171,6 +172,17 @@ class Hardware:
                     f.write(str(uw))
         except OSError as e:
             raise HardwareError(f"无法设置功耗上限（可能被 BIOS 锁定）: {e}") from e
+
+    def power_limits(self):
+        """当前 PL1（W）：msr = 本程序调节的域，mmio = EC 设定的域（实际取两者较小值）。"""
+        out = {}
+        for key, dom in (("msr", RAPL), ("mmio", RAPL_MMIO)):
+            try:
+                with open(f"{dom}/constraint_0_power_limit_uw") as f:
+                    out[key] = int(f.read()) / 1e6
+            except (OSError, ValueError):
+                out[key] = None
+        return out
 
     # ---- 读数 ----
     def power_source(self):

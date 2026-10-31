@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 import json
+import math
 import os
+import random
 import sys
 import tempfile
 import unittest
@@ -8,7 +10,8 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from xiaoxin_fan.control import (Controller, Curve, CPU_HOT_HOLD, EC_IDLE_MIN_HOLD, INVALID_GRACE,  # noqa: E402
-                                 POWER_MIN_W, POWER_START_W, PowerGuard, SOURCE_SETTLE, SourceSwitch)
+                                 POWER_HARD_W_S, POWER_MIN_W, POWER_SEN_LIMIT, POWER_SEN_TARGET, POWER_START_W,
+                                 PowerGuard, SOURCE_SETTLE, SourceSwitch)
 from xiaoxin_fan.hw import check_model, read_dmi  # noqa: E402
 from xiaoxin_fan.presets import DEFAULT_PRESETS, load_presets, resolve  # noqa: E402
 
@@ -148,38 +151,120 @@ class EcIdleTest(unittest.TestCase):
         self.assertEqual((d.target, d.reason), (6000, "guard:nvme0"))
 
 
-class PowerGuardTest(unittest.TestCase):
-    def feed(self, g, sens, t0=0):
-        return [g.step({"cpu": 90, "sen1": s, "sen3": None}, t0 + i) for i, s in enumerate(sens)]
+class SenPlant:
+    """SEN1 热模型（极客满载闭环数据拟合）：死区 θ 秒、时间常数 τ 的一阶响应 + 缓慢热积累，读数取整。"""
 
-    def test_idle_below_limit_no_cap(self):
+    def __init__(self, base=30.3, gain=0.739, tau=5.0, dead=2, drift=1.89):
+        self.base, self.gain, self.a, self.dead, self.drift = base, gain, 1 - math.exp(-1 / tau), dead, drift
+        self.x, self.hist, self.t = 14.0, [14.0] * (dead + 1), 0
+
+    def step(self, watts):
+        self.hist.append(watts)
+        self.x += self.a * (self.hist[-1 - self.dead] - self.x)
+        self.t += 1
+        return self.base + self.gain * self.x + self.drift * self.t / 60
+
+
+def closed_loop(plant, seconds=300):
+    """满载闭环：不限制时功耗 80 W（PL2）。返回逐秒 (SEN 读数, 功耗上限, 实际功耗)。"""
+    g, sen, watts, rows = PowerGuard(), plant.step(14.0), 14.0, []
+    for t in range(seconds):
+        reading = math.floor(sen) + 0.05
+        cap = g.step({"sen1": reading}, float(t), watts)
+        watts = min(80.0, cap if cap is not None else 80.0)
+        sen = plant.step(watts)
+        rows.append((reading, cap, watts))
+    return rows
+
+
+class PowerGuardTest(unittest.TestCase):
+    def feed(self, g, sens, t0=0, pkg_w=65.0):
+        return [g.step({"cpu": 90, "sen1": s, "sen3": None}, t0 + i, pkg_w) for i, s in enumerate(sens)]
+
+    def test_idle_below_target_no_cap(self):
         self.assertEqual(self.feed(PowerGuard(), [70] * 10)[-1], None)
 
-    def test_engages_and_lowers_faster_when_hotter(self):
+    def test_engages_at_target_from_actual_power(self):
+        caps = self.feed(PowerGuard(), [POWER_SEN_TARGET], pkg_w=60.0)
+        self.assertEqual(caps, [60])                 # 起点 = 实际功耗，不从 70 W 慢慢往下试
+
+    def test_fast_rise_engages_early(self):
+        caps = self.feed(PowerGuard(), [62, 65, 68, 71, 74], pkg_w=68.0)
+        self.assertEqual(caps[:4], [None] * 4)       # 低于 72°C 不做预测
+        self.assertIsNotNone(caps[4])                # 74°C、每秒 +3°C：预计越过临界线
+        self.assertLess(caps[4], 68)                 # 起点已扣除预计超出量
+
+    def test_sensor_jump_does_not_slam_to_floor(self):
+        caps = self.feed(PowerGuard(), [63, 67, 71, 79], pkg_w=68.0)   # 实测出现过一秒 +8°C
+        self.assertGreaterEqual(caps[-1], 68 - 13)
+
+    def test_slow_rise_does_not_engage_early(self):
+        caps = self.feed(PowerGuard(), [74, 74.5, 75, 75.5, 76, 76.5, 77, 77.5])
+        self.assertTrue(all(c is None for c in caps), caps)
+
+    def test_full_load_holds_target_without_crossing_limit(self):
+        rows = closed_loop(SenPlant())
+        self.assertLess(max(r[0] for r in rows), POWER_SEN_LIMIT + 1)     # 读数为整数：最多读到 80
+        tail = rows[-100:]
+        self.assertTrue(all(abs(r[0] - POWER_SEN_TARGET) <= 1.1 for r in tail), tail)   # 读数 = 整数 + 0.05
+        ups = sum(1 for a, b in zip(tail, tail[1:]) if b[2] > a[2])
+        self.assertLessEqual(ups, 10)                # 热积累使功耗缓降，但不来回摆动
+
+    def test_stable_with_model_error(self):
+        for plant in (SenPlant(drift=0), SenPlant(base=21.0, gain=0.96, dead=3, drift=0),
+                      SenPlant(base=48.0, gain=0.52, drift=0), SenPlant(base=34.0, tau=8.0, dead=3, drift=0)):
+            rows = closed_loop(plant)
+            self.assertLess(max(r[0] for r in rows), 86)          # 旧的阶梯式调节在同样条件下到 86°C
+            tail = rows[-100:]
+            self.assertTrue(all(abs(r[0] - POWER_SEN_TARGET) <= 1.1 for r in tail), tail)
+            self.assertLessEqual(max(r[2] for r in tail) - min(r[2] for r in tail), 3.0)   # 不振荡
+
+    def test_hard_limit_drops_fast(self):
         g = PowerGuard()
-        slow = self.feed(g, [81] * 5)
-        self.assertEqual(slow[0], POWER_START_W - 2)
-        self.assertEqual(slow[-1], POWER_START_W - 10)
-        fast = self.feed(g, [87] * 3, t0=5)
-        self.assertEqual(slow[-1] - fast[-1], 15)
+        caps = self.feed(g, [79, 86, 86, 86])
+        self.assertTrue(all(a - b >= POWER_HARD_W_S for a, b in zip(caps[1:], caps[2:])), caps)
 
     def test_floor(self):
         self.assertEqual(self.feed(PowerGuard(), [95] * 60)[-1], POWER_MIN_W)
 
-    def test_holds_in_band_then_releases_fully(self):
+    def test_no_release_near_target(self):
+        g = PowerGuard()
+        self.feed(g, [80] * 3, pkg_w=60.0)
+        caps = self.feed(g, [78] * 120, t0=3, pkg_w=60.0)       # 上限一直在起作用，温度略低于目标
+        self.assertTrue(all(c is not None for c in caps), caps)  # 不撤销：撤销后功耗会冲到 80 W
+
+    def test_releases_fully_when_cool(self):
         g = PowerGuard()
         self.feed(g, [85] * 4)
-        held = self.feed(g, [78] * 10, t0=4)                 # 77 < 78 < 80：保持
-        self.assertEqual(len(set(held)), 1)
-        rel = self.feed(g, [70] * 200, t0=14)
-        self.assertEqual(rel[-1], None)                      # 放开到原值后撤销限制
+        rel = self.feed(g, [70] * 120, t0=4, pkg_w=15.0)       # 负载结束
+        self.assertEqual(rel[-1], None)
         self.assertTrue(all(b is None or a is None or b >= a for a, b in zip(rel, rel[1:])))
+
+    def test_no_windup_when_cap_not_binding(self):
+        g = PowerGuard()
+        self.feed(g, [80] * 3, pkg_w=65.0)
+        cap = g.cap
+        held = self.feed(g, [78] * 30, t0=3, pkg_w=cap - 10)   # EC 把功耗压得更低：上限没在起作用
+        self.assertTrue(all(c <= round(cap) for c in held), held)
+
+    def test_unknown_power_starts_from_default(self):
+        cap = PowerGuard().step({"sen1": POWER_SEN_TARGET}, 0)
+        self.assertIsNotNone(cap)
+        self.assertLess(cap, POWER_START_W)
 
     def test_missing_sensor_keeps_state(self):
         g = PowerGuard()
         self.feed(g, [85] * 3)
         cap = g.cap
         self.assertEqual(g.step({"cpu": 90}, 10), round(cap))
+
+    def test_output_always_safe(self):
+        rnd = random.Random(1)
+        g = PowerGuard()
+        for t in range(2000):
+            sen = rnd.choice([None, rnd.uniform(30, 100)])
+            cap = g.step({"sen1": sen}, t * rnd.uniform(0.0, 1.5), rnd.choice([None, rnd.uniform(5, 90)]))
+            self.assertTrue(cap is None or POWER_MIN_W <= cap < POWER_START_W, cap)
 
 
 class SourceSwitchTest(unittest.TestCase):

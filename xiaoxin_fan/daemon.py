@@ -164,13 +164,14 @@ class Daemon:
             self._follow_source(now)
             self._follow_profile()
             temps = self.hw.read_temps()
+            pkg_w = self._safe(self.hw.package_watts)      # 有状态（两次调用之间的平均），每周期只读一次
             d = self.ctrl.step(temps, now)
             if d.target != self.written or (d.target and now - self.last_write >= REWRITE_INTERVAL):
                 self._write(d.target)
-            self._power_step(temps, now)
+            self._power_step(temps, now, pkg_w)
             fans = self.hw.read_rpm()
             self.error = None
-            self._publish(temps, d, fans)
+            self._publish(temps, d, fans, pkg_w)
         except Exception as e:  # noqa: BLE001 —— 任何异常都先确保交还 EC
             self.error = str(e)
             log.error("控制周期出错，交还 EC: %s", e)
@@ -196,16 +197,17 @@ class Daemon:
         if cap is None:
             log.info("SEN 已回落，功耗上限恢复原厂")
         elif self.power_cap is None or abs(cap - self.power_cap) >= 5:
-            log.info("SEN 超过 %.0f°C → 功耗上限 %dW", self.pguard.limit, cap)
+            log.info("SEN 接近 %.0f°C → 功耗上限 %dW", self.pguard.target, cap)
         self.power_cap = cap
 
-    def _power_step(self, temps, now):
+    def _power_step(self, temps, now, pkg_w):
         if self.preset == "stock" or not self.power_guard_ok:
+            self.pguard.reset()
             self._set_power_cap(None)
             return
-        self._set_power_cap(self.pguard.step(temps, now))
+        self._set_power_cap(self.pguard.step(temps, now, pkg_w))
 
-    def _publish(self, temps, d, fans):
+    def _publish(self, temps, d, fans, pkg_w=None):
         p = self.presets[self.preset]
         self.status = {
             "preset": self.preset, "label": p["label"],
@@ -214,8 +216,8 @@ class Daemon:
             "temps": temps, "cpu_smoothed": d.cpu_smoothed if d else None,
             "fans": list(fans) if fans else None,
             "target": self.written, "reason": d.reason if d else "error",
-            "pkg_w": self._safe(self.hw.package_watts),
-            "power_cap": self.power_cap,
+            "pkg_w": pkg_w,
+            "power_cap": self.power_cap, "pl1": self._safe(self.hw.power_limits),
             "source": self.switch.source, "by_source": self.switch.remembered,
             "paused": self.paused, "error": self.error, "time": time.time(),
         }

@@ -62,5 +62,32 @@ class ExternalSwitchTest(unittest.TestCase):
         self.assertNotIn("ac", d.switch.remembered)
 
 
+
+@unittest.skipIf(daemon is None, "需要 python3-gi")
+class PowerStepTest(unittest.TestCase):
+    def test_package_power_read_once_per_tick_and_reported(self):
+        hw = FakeHardware()
+        tmp = tempfile.mkdtemp()
+        d = daemon.Daemon(hw, Gio.BusType.SESSION, os.path.join(tmp, "state.json"), os.path.join(tmp, "none.json"))
+        d.apply_preset("geek", persist=False)
+        calls, real = [], hw.package_watts
+        hw.package_watts = lambda: calls.append(1) or real()     # 有状态的读数，同一周期读两次会得到错误的值
+        d.tick()
+        self.assertEqual(len(calls), 1)
+        self.assertIsInstance(d.status["pkg_w"], float)
+        self.assertEqual(set(d.status["pl1"]), {"msr", "mmio"})
+
+    def test_stock_resets_guard(self):
+        hw = FakeHardware()
+        tmp = tempfile.mkdtemp()
+        d = daemon.Daemon(hw, Gio.BusType.SESSION, os.path.join(tmp, "state.json"), os.path.join(tmp, "none.json"))
+        d.apply_preset("geek", persist=False)
+        d.pguard.step({"sen1": 85.0}, 0.0, 65.0)
+        d.apply_preset("stock", persist=False)
+        d.tick()
+        self.assertIsNone(d.pguard.cap)
+        self.assertIsNone(hw.power_cap)
+
+
 if __name__ == "__main__":
     unittest.main()
