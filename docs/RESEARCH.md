@@ -113,6 +113,16 @@ echo '\_SB.WM10.WMAE 0 0x12 b0100030400000000' > /proc/acpi/call                
 如果关 GKM 是最后一步，low-power / balanced 会停在 70/70 W（v0.2.0 的「静音」「均衡」预设即有此问题）。
 正确顺序：先关 GKM，再发其它 DYTC SET（任意一次都会按 MMC 与各功能标志重算 FCMO）。
 
+**AQM / APM / IEP / IBS 的含义**：BIOS 中只有变量名（`VAQM` 等），没有说明。按缩写与实测推测分别对应
+联想「智能模式」自动切换时的子模式（自动安静 / 自动性能 / 智能高性能 / 智能省电），此为推测，未经官方确认。
+除 FCMO 外，它们各自置位一个输出标志（`ODVH` / `ODVG` / `ODVJ` / `ODVK`），供 Windows 上的 Intel DTT 选择散热策略；
+Linux 不运行 DTT，因此**在 Linux 下实际生效的只有 EC 的功耗上限与风扇上限**。满载对比（MEASUREMENTS 第 8 节）：
+AQM、IBS 与 low-power 完全相同；IEP 与 performance 相同（满载时风扇同样到 3900）；APM 即风扇上限降到 3600 的
+performance，更热，EC 会把 PL1 多压低约 5 W。因此本程序只采用了有独特效果的 STP 与 GKM。
+
+**EC 会动态下调 PL1**：轻负载时读到的 performance 档为 70/70 W，满载变热后 EC 会自行把 MMIO PL1 降到 60 W
+（风扇上限较低的 APM 降到 55 W）。
+
 **Fn+Q**：在 Linux 下按 low-power → balanced → performance 循环，`platform_profile` 同步变化，守护进程随之切换预设。
 
 ## EC 自动风扇逻辑（实测）
