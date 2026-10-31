@@ -31,7 +31,9 @@ mkdir -p /etc/xiaoxin-fan
 echo "[4/5] systemd 服务"
 install -m 644 "$SRC/data/xiaoxin-fand.service" /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable --now xiaoxin-fand
+# reenable：清掉旧版本留下的 multi-user.target 链接（会造成启动顺序环），按新的 [Install] 重新启用
+systemctl reenable xiaoxin-fand
+systemctl start xiaoxin-fand
 
 echo "[5/5] 当前状态"
 sleep 2

@@ -1,7 +1,9 @@
 [Unit]
 Description=小新风扇控制守护进程（xiaoxin-fan）
+# power-profiles-daemon 排在 multi-user.target 之后（WantedBy=graphical.target），
+# 所以本服务也必须挂在 graphical.target 下；挂在 multi-user.target 会形成启动顺序环，被 systemd 直接丢弃。
+# 排在它之后：它先恢复自己保存的电源模式，我们再应用预设。
 After=power-profiles-daemon.service systemd-modules-load.service
-Wants=power-profiles-daemon.service
 
 [Service]
 Type=dbus
@@ -19,4 +21,4 @@ NoNewPrivileges=yes
 ProtectSystem=full
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=graphical.target
