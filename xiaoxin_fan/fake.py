@@ -4,7 +4,7 @@
 import math
 import time
 
-from .hw import PROFILES, validate_rpm
+from .hw import PROFILES, fan_targets
 
 EC_CAPS = {"low-power": 2500, "balanced": 3400, "performance": 3900}
 
@@ -13,7 +13,7 @@ class FakeHardware:
     def __init__(self):
         self.profile = "performance"
         self.extras = []
-        self.target = 0
+        self.target = (0, 0)
         self.rpm = [2300.0, 2200.0]
         self._t0 = self._last = time.monotonic()
         self.power_cap = None
@@ -28,8 +28,8 @@ class FakeHardware:
         now = time.monotonic()
         dt, self._last = now - self._last, now
         cap = 4300 if "gkm" in self.extras else EC_CAPS[self.profile]
-        goal = self.target or (cap if self._cpu() > 75 else 2300)
         for i in range(2):
+            goal = self.target[i] or (cap if self._cpu() > 75 else 2300) - 200 * i
             step = 500 * dt if goal > self.rpm[i] else 33 * dt
             self.rpm[i] += max(-step, min(step, goal - self.rpm[i]))
 
@@ -38,7 +38,7 @@ class FakeHardware:
         return tuple(int(round(r, -2)) for r in self.rpm)
 
     def set_rpm(self, rpm):
-        self.target = validate_rpm(rpm)
+        self.target = fan_targets(rpm)
 
     def release(self):
         self.set_rpm(0)

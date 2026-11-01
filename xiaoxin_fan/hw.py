@@ -27,6 +27,9 @@ FCMO = r"\_SB.PC00.LPCB.EC0.FCMO"
 FAN_IDS = (0x04030001, 0x04030002)
 MIN_MANUAL_RPM = 2000
 MAX_RPM = 6000
+# 风扇 2 比风扇 1 低这么多（不低于 2000）。EC 自己也是这样（3900/3700、4300/4100）；
+# 两个风扇同转速时会有“嗡—嗡”的拍频，听感对比见 tools/fan-offset-listen.sh。
+FAN2_OFFSET = 200
 
 # DYTC SET 功能号（见 DSDT 中 Method (DYTC)）
 DYTC_FUNCS = {"stp": 4, "apm": 5, "aqm": 6, "iep": 7, "ibs": 8}
@@ -52,6 +55,14 @@ def validate_rpm(rpm):
     if not MIN_MANUAL_RPM <= rpm <= MAX_RPM:
         raise ValueError(f"转速 {rpm} 超出允许范围 {MIN_MANUAL_RPM}–{MAX_RPM}")
     return round(rpm / 100) * 100
+
+
+def fan_targets(rpm):
+    """目标转速 → (风扇 1, 风扇 2)。0 = 两个都交还 EC；两个值都经过 validate_rpm。"""
+    rpm = validate_rpm(rpm)
+    if rpm == 0:
+        return 0, 0
+    return rpm, validate_rpm(max(MIN_MANUAL_RPM, rpm - FAN2_OFFSET))
 
 
 def _acpi(expr):
@@ -110,11 +121,10 @@ class Hardware:
         return tuple(_acpi(f"{WMAE} 0 0x11 {fid:#x}") for fid in FAN_IDS)
 
     def set_rpm(self, rpm):
-        """rpm=0 交还 EC；否则设为 [2000, 6000] 内、取整到 100 的目标转速。"""
-        rpm = validate_rpm(rpm)
+        """rpm=0 交还 EC；否则风扇 1 设为 [2000, 6000] 内、取整到 100 的目标转速，风扇 2 略低（见 fan_targets）。"""
         ok = True
-        for fid in FAN_IDS:
-            buf = struct.pack("<II", fid, rpm).hex()
+        for fid, value in zip(FAN_IDS, fan_targets(rpm)):
+            buf = struct.pack("<II", fid, value).hex()
             ok &= _acpi(f"{WMAE} 0 0x12 b{buf}") == 0
         if not ok:
             raise HardwareError(f"EC 未确认风扇设定 {rpm}")

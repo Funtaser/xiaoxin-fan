@@ -9,10 +9,11 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from xiaoxin_fan.control import (Controller, Curve, CPU_HOT_HOLD, EC_IDLE_MIN_HOLD, INVALID_GRACE,  # noqa: E402
+from xiaoxin_fan.control import (Controller, Curve, CPU_HOT_HOLD, EC_IDLE_MIN_HOLD, EC_IDLE_TAKE_HOLD,  # noqa: E402
+                                 INVALID_GRACE, UP_RATE,
                                  POWER_HARD_W_S, POWER_MIN_W, POWER_SEN_LIMIT, POWER_SEN_TARGET, POWER_START_W,
                                  PowerGuard, SOURCE_SETTLE, SourceSwitch)
-from xiaoxin_fan.hw import check_model, read_dmi  # noqa: E402
+from xiaoxin_fan.hw import FAN2_OFFSET, check_model, fan_targets, read_dmi  # noqa: E402
 from xiaoxin_fan.presets import DEFAULT_PRESETS, load_presets, resolve  # noqa: E402
 
 CURVE = Curve([[0, 2000], [60, 2000], [80, 4000], [90, 5000]])
@@ -53,6 +54,27 @@ class ControllerTest(unittest.TestCase):
         down = run(c, [50] * 5, t0=len(up))
         drops = [a.target - b.target for a, b in zip(up[-1:] + down, down)]
         self.assertTrue(all(d <= 100 for d in drops), drops)
+
+    def test_short_burst_rises_slowly(self):
+        c = Controller(CURVE)
+        run(c, [50] * 10)
+        out = run(c, [76] * 3, t0=10)
+        rises = [b.target - a.target for a, b in zip([c.step({"cpu": 50}, 9.5)] + out, out)]
+        self.assertTrue(all(r <= UP_RATE for r in rises), rises)
+
+    def test_stops_rising_when_burst_ends(self):
+        c = Controller(CURVE)
+        run(c, [50] * 10)
+        out = run(c, [76, 76, 55, 52, 50, 50], t0=10)
+        after = [d.target for d in out[2:]]
+        self.assertTrue(all(b <= a for a, b in zip(after, after[1:])), after)
+        self.assertLessEqual(max(after), out[1].target)
+
+    def test_hot_rises_without_limit(self):
+        c = Controller(CURVE)
+        run(c, [50] * 10)
+        out = run(c, [95] * 8, t0=10)
+        self.assertEqual(out[-1].target, 5000)                    # 平滑温度过 80°C 后直接到曲线值
 
     def test_rate_limit_after_stall(self):
         c = Controller(CURVE)
@@ -108,12 +130,31 @@ class ControllerTest(unittest.TestCase):
             self.assertEqual(d.target % 100, 0)
 
 
+class FanTargetsTest(unittest.TestCase):
+    def test_release_both(self):
+        self.assertEqual(fan_targets(0), (0, 0))
+
+    def test_second_fan_slightly_slower_never_below_min(self):
+        self.assertEqual(fan_targets(3000), (3000, 3000 - FAN2_OFFSET))
+        self.assertEqual(fan_targets(6000), (6000, 6000 - FAN2_OFFSET))
+        self.assertEqual(fan_targets(2100), (2100, 2000))
+        self.assertEqual(fan_targets(2000), (2000, 2000))
+
+    def test_never_stops_a_fan(self):
+        for rpm in [0] + list(range(2000, 6001, 100)):
+            for v in fan_targets(rpm):
+                self.assertTrue(v == 0 or 2000 <= v <= 6000, (rpm, v))
+        for bad in (1, 100, 1999, 6100):
+            with self.assertRaises(ValueError):
+                fan_targets(bad)
+
+
 class EcIdleTest(unittest.TestCase):
     def test_hands_back_when_cool_and_takes_over_when_warm(self):
         c = Controller(CURVE, ec_below=55)
         cool = run(c, [45] * 5)
         self.assertEqual((cool[-1].target, cool[-1].reason), (0, "ec-idle"))
-        warm = run(c, [70] * 10, t0=5)
+        warm = run(c, [70] * 20, t0=5)
         self.assertEqual(warm[-1].reason, "curve")
         self.assertGreater(warm[-1].target, 0)
 
@@ -130,21 +171,37 @@ class EcIdleTest(unittest.TestCase):
         out = run(c, [42, 42, 56, 42, 42, 55, 42, 42], t0=10)              # 短时尖峰
         self.assertTrue(all(d.reason == "ec-idle" for d in out))
 
-    def test_real_load_takes_over_fast(self):
+    def test_sustained_load_takes_over(self):
         c = Controller(CURVE, ec_below=50)
         run(c, [42] * 10)
         self.assertEqual(c.step({"cpu": 42}, 10).reason, "ec-idle")
-        out = run(c, [75] * 6, t0=11)
+        out = run(c, [80] * int(EC_IDLE_TAKE_HOLD + 3), t0=11)
         self.assertEqual(out[-1].reason, "curve")
         self.assertGreater(out[-1].target, 0)
+
+    def test_short_burst_stays_with_ec(self):
+        for ec_below in (50, 55, 60):
+            for n in (2, 3, 5):
+                c = Controller(CURVE, ec_below=ec_below)
+                run(c, [ec_below - 8] * 30)
+                out = run(c, [ec_below - 8, 85] + [87] * n + [ec_below] + [ec_below - 8] * 60, t0=30)
+                self.assertTrue(all(d.reason == "ec-idle" for d in out), (ec_below, n))
+
+    def test_very_hot_takes_over_immediately(self):
+        c = Controller(CURVE, ec_below=50)
+        run(c, [42] * 10)
+        self.assertEqual(c.step({"cpu": 93}, 10).reason, "curve")
 
     def test_min_hold_prevents_flapping(self):
         c = Controller(CURVE, ec_below=50)
         self.assertEqual(run(c, [42] * 10)[-1].reason, "ec-idle")          # 交给 EC
-        run(c, [56] * 20, t0=10)                                            # 接管
-        out = run(c, [40] * (int(EC_IDLE_MIN_HOLD) - 25), t0=30)            # 很快降温，但未满保持时间
+        run(c, [56] * 30, t0=10)                                            # 接管
+        taken = c._taken_at
+        self.assertIsNotNone(taken)
+        n = int(taken + EC_IDLE_MIN_HOLD - 40)
+        out = run(c, [40] * n, t0=40)                                       # 很快降温，但未满保持时间
         self.assertTrue(all(d.reason == "curve" for d in out))
-        self.assertEqual(run(c, [40] * 10, t0=70)[-1].reason, "ec-idle")    # 满 60 s 后交出
+        self.assertEqual(run(c, [40] * 10, t0=40 + n)[-1].reason, "ec-idle")  # 满 60 s 后交出
 
     def test_guard_overrides_ec_idle(self):
         d = run(Controller(CURVE, ec_below=55), [{"cpu": 40, "nvme0": 82}] * 3)[-1]

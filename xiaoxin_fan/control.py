@@ -5,7 +5,7 @@
   0      → 交还 EC 自动控制
   其它   → 手动目标 rpm（2000–6000，取整到 100）
 
-处理顺序：温度平滑 → 曲线插值（降温方向带回差）→ 安全下限 → 降速限速。
+处理顺序：温度平滑 → 曲线插值（降温方向带回差）→ 安全下限 → 交给 EC / 接管 → 升降速限速。
 """
 
 from dataclasses import dataclass, field
@@ -15,6 +15,10 @@ from .hw import MAX_RPM, MIN_MANUAL_RPM
 EMA_ALPHA = 0.35          # CPU 温度指数平滑系数（1 Hz 采样）
 HYSTERESIS = 3.0          # 降温时需多降这么多度，转速才开始下降
 DOWN_RATE = 100           # 每秒最多降低的 rpm（EC 自身约 33 rpm/s）
+# 开应用、编译开头这类几秒的突发会让 x86_pkg_temp 一秒内跳 20–30°C；温度不高时慢慢升速，突发结束前
+# 只多转几百 rpm，而不是一下冲上去再慢慢降。平滑温度到 UP_FREE 以上、或任何安全保护生效时不限。
+UP_RATE = 200             # 曲线模式下每秒最多升高的 rpm
+UP_FREE = 80.0
 INVALID_GRACE = 5.0       # 传感器连续无效超过此秒数 → 交还 EC
 CPU_HOT = 98.0            # CPU 持续高于此温度……
 CPU_HOT_HOLD = 20.0       # ……超过此秒数，则风扇不低于 CPU_HOT_FLOOR
@@ -24,7 +28,11 @@ CPU_HOT_FLOOR = 4500
 EC_IDLE_HYST = 5.0        # 低于 ec_below-5 才交出，回到 ec_below 再接管
 EC_IDLE_ALPHA = 0.1       # 判断用的慢速平滑（约 10 s），单次尖峰几乎不影响
 EC_IDLE_MIN_HOLD = 60.0   # 接管后至少保持这么多秒才可能交出
-EC_IDLE_FAST = 10.0       # 快速平滑温度超过 ec_below+10（真实负载）时立即接管，不等慢速平滑
+EC_IDLE_FAST = 10.0       # 快速平滑温度超过 ec_below+10（真实负载）时接管，不等慢速平滑
+# 接管条件须持续 EC_IDLE_TAKE_HOLD 秒：几秒的突发不应让风扇从停转直接转满一分钟（原厂 EC 约 75°C 持续 20 s
+# 才升速，交给 EC 期间就是原厂行为，推迟接管不会比原厂差）。原始温度过高或安全保护生效时立即接管。
+EC_IDLE_TAKE_HOLD = 10.0
+EC_IDLE_HARD = 90.0
 
 # (传感器前缀, 温度阈值, 转速下限)
 # SEN1 紧贴 CPU/供电，随功耗快速升温；原厂 EC 在 4 线程负载下让它到 73°C+ 仍只开 3900，
@@ -78,6 +86,7 @@ class Controller:
     _ec_idle: bool = False
     _idle_ema: float | None = None
     _taken_at: float | None = None
+    _warm_since: float | None = None     # 交给 EC 期间，接管条件开始成立的时刻
     _ema: float | None = None
     _last: int = 0
     _last_time: float | None = None
@@ -87,7 +96,7 @@ class Controller:
 
     def reset(self):
         self._ema = self._last_time = self._invalid_since = self._hot_since = self._eval_temp = None
-        self._idle_ema = self._taken_at = None
+        self._idle_ema = self._taken_at = self._warm_since = None
         self._last = 0
         self._ec_idle = False
 
@@ -106,6 +115,7 @@ class Controller:
         else:
             self._invalid_since = None
 
+        rising = self._ema is None or cpu > self._ema
         self._ema = cpu if self._ema is None else self._ema + EMA_ALPHA * (cpu - self._ema)
         self._idle_ema = cpu if self._idle_ema is None else self._idle_ema + EC_IDLE_ALPHA * (cpu - self._idle_ema)
 
@@ -132,8 +142,15 @@ class Controller:
         # 低温交给 EC；任何安全保护生效时都不交出
         if self.ec_below is not None and reason == "curve":
             if self._ec_idle:
-                if self._idle_ema >= self.ec_below or self._ema >= self.ec_below + EC_IDLE_FAST:
-                    self._ec_idle, self._taken_at = False, now
+                # 慢速平滑在突发结束后还会高几秒，因此同时要求快速平滑仍未回落
+                warm = self._ema >= self.ec_below and (
+                    self._idle_ema >= self.ec_below or self._ema >= self.ec_below + EC_IDLE_FAST)
+                if not warm:
+                    self._warm_since = None
+                elif self._warm_since is None:
+                    self._warm_since = now
+                if cpu >= EC_IDLE_HARD or (warm and now - self._warm_since >= EC_IDLE_TAKE_HOLD):
+                    self._ec_idle, self._taken_at, self._warm_since = False, now, None
             elif self._idle_ema < self.ec_below - EC_IDLE_HYST and (
                     self._taken_at is None or now - self._taken_at >= EC_IDLE_MIN_HOLD):
                 self._ec_idle = True
@@ -141,12 +158,16 @@ class Controller:
                 self._last, self._last_time = 0, now
                 return Decision(0, "ec-idle", round(self._ema, 1))
         elif self._ec_idle:                      # 安全保护生效：立即接管
-            self._ec_idle, self._taken_at = False, now
+            self._ec_idle, self._taken_at, self._warm_since = False, now, None
 
-        # 降速限速（升速不限，安全优先）
-        if self._last and self._last_time is not None and target < self._last:
+        # 升降速限速（升速只在温度不高、无安全保护时限制）
+        if self._last and self._last_time is not None:
             dt = min(max(now - self._last_time, 0.0), 2.0)       # 卡顿后恢复时不“攒额度”
-            target = max(target, self._last - DOWN_RATE * dt)
+            if target < self._last:
+                target = max(target, self._last - DOWN_RATE * dt)
+            elif reason == "curve" and self._ema < UP_FREE:
+                # 突发已结束（平滑温度开始回落）就不再升；回差会让曲线值再停留一会儿
+                target = min(target, self._last + UP_RATE * max(dt, 1.0) if rising else self._last)
 
         target = min(MAX_RPM, max(MIN_MANUAL_RPM, quantize(target)))
         self._last, self._last_time = target, now
