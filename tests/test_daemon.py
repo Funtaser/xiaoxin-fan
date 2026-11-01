@@ -77,6 +77,17 @@ class PowerStepTest(unittest.TestCase):
         self.assertIsInstance(d.status["pkg_w"], float)
         self.assertEqual(set(d.status["pl1"]), {"msr", "mmio"})
 
+    def test_fan_guard_follows_power_guard_availability(self):
+        hw = FakeHardware()
+        tmp = tempfile.mkdtemp()
+        d = daemon.Daemon(hw, Gio.BusType.SESSION, os.path.join(tmp, "state.json"), os.path.join(tmp, "none.json"))
+        d.apply_preset("performance", persist=False)
+        d.tick()
+        self.assertTrue(d.ctrl.power_guarded)
+        d.power_guard_ok = False                        # 例如 MSR 被 BIOS 锁定、写入失败
+        d.tick()
+        self.assertFalse(d.ctrl.power_guarded)
+
     def test_stock_resets_guard(self):
         hw = FakeHardware()
         tmp = tempfile.mkdtemp()

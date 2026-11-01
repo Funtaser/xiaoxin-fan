@@ -165,6 +165,7 @@ class Daemon:
             self._follow_profile()
             temps = self.hw.read_temps()
             pkg_w = self._safe(self.hw.package_watts)      # 有状态（两次调用之间的平均），每周期只读一次
+            self.ctrl.power_guarded = self._power_guard_active()
             d = self.ctrl.step(temps, now)
             if d.target != self.written or (d.target and now - self.last_write >= REWRITE_INTERVAL):
                 self._write(d.target)
@@ -200,8 +201,11 @@ class Daemon:
             log.info("SEN 接近 %.0f°C → 功耗上限 %dW", self.pguard.target, cap)
         self.power_cap = cap
 
+    def _power_guard_active(self):
+        return self.preset != "stock" and self.power_guard_ok
+
     def _power_step(self, temps, now, pkg_w):
-        if self.preset == "stock" or not self.power_guard_ok:
+        if not self._power_guard_active():
             self.pguard.reset()
             self._set_power_cap(None)
             return

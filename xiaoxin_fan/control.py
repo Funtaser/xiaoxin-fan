@@ -37,10 +37,19 @@ EC_IDLE_HARD = 90.0
 # (传感器前缀, 温度阈值, 转速下限)
 # SEN1 紧贴 CPU/供电，随功耗快速升温；原厂 EC 在 4 线程负载下让它到 73°C+ 仍只开 3900，
 # BIOS 散热表：SEN 过热 75 / 临界 80（Linux 不轮询该温区，越过临界也不会关机）。风扇对 SEN1 影响有限
-# （6000 比 3900 仅低约 2–4°C），所以风扇只在原厂工作区间之上介入，真正压住 SEN1 靠下方的 PowerGuard。NVMe 警告 83.85。
+# （6000 比 3900 仅低约 2–4°C），真正压住 SEN1 靠下方的 PowerGuard。NVMe 警告 83.85。
 GUARDS = (
     ("sen", 76.0, MAX_RPM),
     ("sen", 72.0, 4500),
+    ("nvme", 80.0, MAX_RPM),
+    ("nvme", 75.0, 5000),
+)
+# 功耗保护在工作时会把 SEN1 稳在 79°C；风扇保护线若仍在 72/76°C，满载时任何预设都会被推到 6000 rpm
+# （实测性能预设曲线上限 4300，满载却是 6000）。因此功耗保护可用时，SEN 保护线移到其目标之上，
+# 只在功耗已压到底仍压不住时介入；功耗保护不可用（写入失败、原厂预设）时仍用 GUARDS。
+GUARDS_WITH_POWER = (
+    ("sen", 83.0, MAX_RPM),
+    ("sen", 81.0, 4500),
     ("nvme", 80.0, MAX_RPM),
     ("nvme", 75.0, 5000),
 )
@@ -83,6 +92,7 @@ class Decision:
 class Controller:
     curve: Curve | None          # None = 原厂模式（全程交给 EC）
     ec_below: float | None = None  # 平滑 CPU 温度低于此值时交给 EC（EC 低温时可让风扇停转）
+    power_guarded: bool = False    # 功耗保护可用时由守护进程置 True（SEN 保护线改用 GUARDS_WITH_POWER）
     _ec_idle: bool = False
     _idle_ema: float | None = None
     _taken_at: float | None = None
@@ -128,7 +138,7 @@ class Controller:
         reason = "curve"
 
         # 安全下限
-        for prefix, limit, floor in GUARDS:
+        for prefix, limit, floor in GUARDS_WITH_POWER if self.power_guarded else GUARDS:
             hot = [n for n, t in temps.items() if n.startswith(prefix) and t is not None and t >= limit]
             if hot and floor > target:
                 target, reason = floor, f"guard:{hot[0]}"

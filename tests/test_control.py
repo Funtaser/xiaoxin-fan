@@ -108,6 +108,15 @@ class ControllerTest(unittest.TestCase):
         d = run(Controller(CURVE), [{"cpu": 50, "sen2": 77}] * 3)[-1]
         self.assertEqual(d.target, 6000)
 
+    def test_board_sensor_guard_moves_above_power_target(self):
+        def last(temps):
+            return run(Controller(CURVE, power_guarded=True), [temps] * 3)[-1]
+        self.assertEqual(last({"cpu": 50, "sen1": 80}).reason, "curve")     # 功耗保护稳在 79–80°C：风扇不介入
+        self.assertEqual((last({"cpu": 50, "sen1": 81}).target, last({"cpu": 50, "sen1": 81}).reason),
+                         (4500, "guard:sen1"))
+        self.assertEqual(last({"cpu": 50, "sen2": 83}).target, 6000)
+        self.assertEqual(last({"cpu": 50, "nvme0": 81}).target, 6000)       # NVMe 保护线不变
+
     def test_nvme_guard(self):
         d = run(Controller(CURVE), [{"cpu": 50, "nvme1": 81}] * 3)[-1]
         self.assertEqual((d.target, d.reason), (6000, "guard:nvme1"))
