@@ -87,7 +87,7 @@ fanctl set 原厂        # 一键回到出厂行为
 | `xiaoxin_fan/` | 守护进程、控制逻辑、硬件访问层（唯一调用 `acpi_call` 之处，白名单） |
 | `gnome-extension/` | GNOME 快捷设置面板 |
 | `tests/` | 控制逻辑、预设、机型校验单元测试 |
-| `tools/` | 研究用探测脚本（读转速、手动设定测试、除尘记录、负载对比等），Windows 采集脚本 |
+| `tools/` | 研究用探测脚本（读转速、手动设定测试、除尘记录、负载对比、双风扇听感对比等），Windows 采集脚本；`record-trace.py` 逐秒记录守护进程状态（无需 sudo，适合在真实编译时开着） |
 | `docs/` | [逆向分析](docs/RESEARCH.md)、[实测数据](docs/MEASUREMENTS.md)、[其它机型兼容性检查](docs/COMPATIBILITY.md) |
 
 ## 开发
